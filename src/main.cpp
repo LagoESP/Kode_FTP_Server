@@ -6,6 +6,11 @@
 #include <kodedot/display_manager.h>
 #include <lvgl.h>
 
+// --- Includes para el IO Expander y botones ---
+#include <TCA9555.h>
+#include <kodedot/pin_config.h>
+
+
 /* ───────── KODE DOT SD PINS ───────── */
 int clk = 6;    /* Clock pin (CLK) */
 int cmd = 5;    /* Command pin (CMD) */
@@ -17,6 +22,15 @@ extern const lv_font_t Inter_30;
 
 FtpServer ftpSrv;
 DisplayManager display;
+
+// --- Instancia del IO Expander (GLOBAL) ---
+static TCA9555 ioexp(IOEXP_I2C_ADDR);
+
+// --- Variables de estado de botones y pantalla ---
+static bool is_screen_on = true;
+static uint32_t last_button_press_time = 0;
+static const uint32_t DEBOUNCE_DELAY_MS = 200; // 200ms de antirrebote
+static const uint32_t GUI_LOOP_DELAY_MS = 5; // Delay del loop principal
 
 // UI Components
 lv_obj_t* status_label;
@@ -36,7 +50,8 @@ void ui_show_connecting() {
     // Spinner
     lv_obj_t * spinner = lv_spinner_create(cont);
     lv_obj_set_size(spinner, 64, 64);
-    lv_obj_set_style_arc_color(spinner, lv_color_hex(0xFF7F1F), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+    // CORREGIDO: Sintaxis de LVGL v9 para eliminar la advertencia
+    lv_obj_set_style_arc_color(spinner, lv_color_hex(0xFF7F1F), LV_PART_INDICATOR);
 
     
     // Text
@@ -102,6 +117,7 @@ void ui_update_status(const char* msg) {
 /* --- System Logic --- */
 
 void loadWifiConfig() {
+    // CAMBIO: Ruta ajustada a la raíz, según tu petición
     const char* configPath = "/Wi-Fi.json";
 
     if (!SD_MMC.exists(configPath)) {
@@ -162,6 +178,70 @@ void loadWifiConfig() {
     ui_update_status("All connections\nfailed!");
 }
 
+static inline bool isPressed(uint8_t pinIndex) {
+    // Entradas con pull-up externa: activo en LOW
+    int v = ioexp.read1(pinIndex);
+    return (v != TCA9555_INVALID_READ) && (v == LOW);
+}
+
+/**
+ * @brief Lee los botones del IO expander y actúa.
+ */
+void handle_buttons() {
+    // Antirrebote simple: solo permite una acción cada 200ms
+    if (millis() - last_button_press_time < DEBOUNCE_DELAY_MS) {
+        return;
+    }
+
+    // Lee los botones (Activo en BAJO)
+    bool left_pressed = isPressed(EXPANDER_PAD_LEFT);
+    bool right_pressed = isPressed(EXPANDER_PAD_RIGHT);
+    bool down_pressed = isPressed(EXPANDER_BUTTON_BOTTOM);
+
+    if (left_pressed) {
+        // --- Brillo Abajo ---
+        uint8_t current_pct = display.getBrightnessPercentage();
+        // CAMBIO: Ajuste de 5%
+        int new_pct = current_pct - 5; 
+        if (new_pct < 1) new_pct = 1; // Mínimo 1%
+
+        // Convertir porcentaje (0-100) a nivel (0-255)
+        uint8_t new_level_255 = (uint8_t)((new_pct / 100.0f) * 255.0f);
+        display.setBrightness(new_level_255);
+        
+        Serial.printf("Brightness set to %d%% (%d/255)\n", new_pct, new_level_255);
+        last_button_press_time = millis();
+
+    } else if (right_pressed) {
+        // --- Brillo Arriba ---
+        uint8_t current_pct = display.getBrightnessPercentage();
+        // CAMBIO: Ajuste de 5%
+        int new_pct = current_pct + 5;
+        if (new_pct > 100) new_pct = 100; // Máximo 100%
+
+        // Convertir porcentaje (0-100) a nivel (0-255)
+        uint8_t new_level_255 = (uint8_t)((new_pct / 100.0f) * 255.0f);
+        display.setBrightness(new_level_255);
+        
+        Serial.printf("Brightness set to %d%% (%d/255)\n", new_pct, new_level_255);
+        last_button_press_time = millis();
+
+    } else if (down_pressed) {
+        // --- Apagar/Encender Pantalla ---
+        is_screen_on = !is_screen_on;
+        
+        // CORREGIDO: Usar displayOn() y displayOff()
+        if (is_screen_on) {
+            display.getGfx()->displayOn(); // Encender pantalla
+        } else {
+            display.getGfx()->displayOff(); // Apagar pantalla
+        }
+        
+        Serial.printf("Screen Toggled: %s\n", is_screen_on ? "ON" : "OFF");
+        last_button_press_time = millis();
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     
@@ -173,6 +253,20 @@ void setup() {
     ui_show_connecting();
     display.update();
 
+    // --- AÑADIDO: Inicializar IO Expander ---
+    // Usar el objeto 'ioexp' global
+    
+    // SOLUCIÓN: Evitar colisión de macros. Arduino define INPUT como 0x01,
+    // lo que interfiere con TCA9555::INPUT.
+    if (!ioexp.begin(INPUT)) {
+        Serial.println("Warning: IO Expander (TCA9555) not found!");
+        ui_update_status("Error:\nIO Expander");
+    } else {
+        Serial.println("IO Expander initialized.");
+    }
+    // Restaurar la macro de Arduino por si se necesita después
+
+
     // 3. Init SD Card
     Serial.println("\nBooting Kode Dot FTP...");
     if (!SD_MMC.setPins(clk, cmd, d0)) {
@@ -180,15 +274,17 @@ void setup() {
         ui_update_status("SD Pin Error");
         return;
     }
+    // NOTA: Montas en /sdcard, pero accedes a Wi-Fi.json en /
+    // Asegúrate de que esto sea correcto. El FTP servirá desde /
     if (!SD_MMC.begin("/sdcard", 1)) {
         Serial.println("Card Mount Failed!");
         ui_update_status("SD Mount Failed\nCheck Card");
         return;
     }
     Serial.println("SD Mounted.");
-
+    
     // 4. Connect Wi-Fi
-    loadWifiConfig();
+    loadWifiConfig(); // Esta función ahora usa la ruta /Wi-Fi.json
 
     // 5. Start FTP & Update UI
     if (WiFi.status() == WL_CONNECTED) {
@@ -206,5 +302,7 @@ void setup() {
 
 void loop() {
     ftpSrv.handleFTP();
-    display.update(); // Handle LVGL tasks
+    display.update();   // Handle LVGL tasks
+    handle_buttons(); // Handle button inputs
+    delay(GUI_LOOP_DELAY_MS); // Añadir un pequeño delay
 }
