@@ -21,6 +21,7 @@
 #define LV_USE_BLEND_MODES      1
 #define LV_USE_OPA_SCALE        1
 #define LV_USE_IMG_TRANSFORM    1
+#define LV_USE_QRCODE           1
 
 /* Widget usage */
 #define LV_USE_ARC              1
