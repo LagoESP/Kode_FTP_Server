@@ -5,90 +5,83 @@
 #include "ESP32FtpServer.h"
 #include <kodedot/display_manager.h>
 #include <lvgl.h>
-
-// --- Includes para el IO Expander y botones ---
 #include <TCA9555.h>
 #include <kodedot/pin_config.h>
+#include <esp_task_wdt.h> // Watchdog
 
+int clk = 6;
+int cmd = 5;
+int d0  = 7;
 
-/* ───────── KODE DOT SD PINS ───────── */
-int clk = 6;    /* Clock pin (CLK) */
-int cmd = 5;    /* Command pin (CMD) */
-int d0  = 7;    /* Data0 pin (D0) */
-
-// --- External Fonts from src/fonts/ ---
 extern const lv_font_t Inter_20;
-extern const lv_font_t Inter_30; 
+extern const lv_font_t Inter_30;
 
 FtpServer ftpSrv;
 DisplayManager display;
-
-// --- Instancia del IO Expander (GLOBAL) ---
 static TCA9555 ioexp(IOEXP_I2C_ADDR);
 
-// --- Variables de estado de botones y pantalla ---
 static bool is_screen_on = true;
 static uint32_t last_button_press_time = 0;
-static const uint32_t DEBOUNCE_DELAY_MS = 200; // 200ms de antirrebote
-static const uint32_t GUI_LOOP_DELAY_MS = 5; // Delay del loop principal
+static uint32_t last_brightness_change = 0;
+static const uint32_t DEBOUNCE_DELAY_MS = 200;
+static const uint32_t BRIGHTNESS_DELAY_MS = 150;
 
-// UI Components
 lv_obj_t* status_label;
 
-/* --- UI Helper Functions --- */
+void handle_buttons();
+void ui_show_connecting();
+void ui_show_connected(const char* ip, int port, const char* user, const char* pass);
+void ui_update_status(const char* msg);
+void loadWifiConfig();
+static inline bool isPressed(uint8_t pinIndex);
 
+// === CORE 1 TASK: FTP SERVER ===
+void ftpTask(void* pv) {
+    while (1) {
+        ftpSrv.handleFTP();
+        vTaskDelay(pdMS_TO_TICKS(4)); // ~250 Hz, WDT-safe
+    }
+}
+
+// === UI TASKS (Core 0) ===
 void ui_show_connecting() {
-    lv_obj_clean(lv_scr_act()); // Clear screen
-    
-    // Create a container for alignment
-    lv_obj_t * cont = lv_obj_create(lv_scr_act());
+    lv_obj_clean(lv_scr_act());
+    lv_obj_t* cont = lv_obj_create(lv_scr_act());
     lv_obj_set_size(cont, LV_PCT(80), LV_PCT(50));
     lv_obj_center(cont);
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     
-    // Spinner
-    lv_obj_t * spinner = lv_spinner_create(cont);
+    lv_obj_t* spinner = lv_spinner_create(cont);
     lv_obj_set_size(spinner, 64, 64);
-    // CORREGIDO: Sintaxis de LVGL v9 para eliminar la advertencia
     lv_obj_set_style_arc_color(spinner, lv_color_hex(0xFF7F1F), LV_PART_INDICATOR);
 
-    
-    // Text
     status_label = lv_label_create(cont);
-    // Use Inter font here too
     lv_obj_set_style_text_font(status_label, &Inter_20, 0);
     lv_label_set_text(status_label, "Connecting to Wi-Fi...");
     lv_obj_set_style_text_align(status_label, LV_TEXT_ALIGN_CENTER, 0);
 }
 
 void ui_show_connected(const char* ip, int port, const char* user, const char* pass) {
-    lv_obj_clean(lv_scr_act()); // Clear screen
+    lv_obj_clean(lv_scr_act());
 
-    // 1. Create QR Code
-    // URI Format: ftp://user:pass@IP:PORT
     char qr_data[128];
     snprintf(qr_data, sizeof(qr_data), "ftp://%s:%s@%s:%d", user, pass, ip, port);
     
-    // QR Widget (200px size)
-    lv_obj_t * qr = lv_qrcode_create(lv_scr_act());
-    lv_qrcode_set_size(qr, 200);
-    lv_color_t lv_color_light = lv_color_hex(0xFFFFFF); // White background
-    lv_color_t lv_color_dark = lv_color_hex(0xf79c89); // Kode Dot Orange
-    lv_qrcode_set_dark_color(qr, lv_color_dark);
-    lv_qrcode_set_light_color(qr, lv_color_light);
+    lv_obj_t* qr = lv_qrcode_create(lv_scr_act());
+    lv_qrcode_set_size(qr, 250);
+    lv_qrcode_set_dark_color(qr, lv_color_hex(0xf79c89));
+    lv_qrcode_set_light_color(qr, lv_color_hex(0xFFFFFF));
     lv_qrcode_update(qr, qr_data, strlen(qr_data));
     lv_obj_align(qr, LV_ALIGN_TOP_MID, 0, 40);
     
-    // 2. Border/Background for QR to make it pop
     lv_obj_set_style_border_width(qr, 5, 0);
     lv_obj_set_style_border_color(qr, lv_color_white(), 0);
     lv_obj_set_style_outline_width(qr, 2, 0);
     lv_obj_set_style_outline_color(qr, lv_color_black(), 0);
 
-    // 3. Info Text
-    lv_obj_t * info_label = lv_label_create(lv_scr_act());
-    lv_label_set_text_fmt(info_label, 
+    lv_obj_t* info_label = lv_label_create(lv_scr_act());
+    lv_label_set_text_fmt(info_label,
         "FTP SERVER #5f9c79 READY#\n\n"
         "IP: #304738 %s#\n"
         "Port: #2c6343 %d#\n"
@@ -96,30 +89,21 @@ void ui_show_connected(const char* ip, int port, const char* user, const char* p
         "Pass: #8eb19d %s#",
         ip, port, user, pass
     );
-    
-    // Style the text with Inter Font
-    lv_label_set_recolor(info_label, true); // Enable inline color parsing
+    lv_label_set_recolor(info_label, true);
     lv_obj_set_style_text_align(info_label, LV_TEXT_ALIGN_CENTER, 0);
-    
-    // CHANGED: Switch from montserrat to Inter
-    lv_obj_set_style_text_font(info_label, &Inter_20, 0); 
-    
+    lv_obj_set_style_text_font(info_label, &Inter_20, 0);
     lv_obj_align(info_label, LV_ALIGN_BOTTOM_MID, 0, -40);
 }
 
 void ui_update_status(const char* msg) {
     if (status_label) {
         lv_label_set_text(status_label, msg);
-        display.update(); // Force redraw immediately
+        display.update();
     }
 }
 
-/* --- System Logic --- */
-
 void loadWifiConfig() {
-    // CAMBIO: Ruta ajustada a la raíz, según tu petición
     const char* configPath = "/Wi-Fi.json";
-
     if (!SD_MMC.exists(configPath)) {
         ui_update_status("Error: Wi-Fi.json\nnot found!");
         Serial.printf("Config Error: %s not found!\n", configPath);
@@ -134,9 +118,12 @@ void loadWifiConfig() {
         return;
     }
 
-    JsonDocument doc;
+    // 🔑 Use StaticJsonDocument to avoid heap frag + limit size
+    const size_t CAPACITY = JSON_OBJECT_SIZE(2) * 5 + JSON_ARRAY_SIZE(5) + 200;
+    StaticJsonDocument<CAPACITY> doc;
+
     DeserializationError error = deserializeJson(doc, file);
-    file.close();
+    file.close(); // Safe: doc is static, owns its memory
 
     if (error) {
         Serial.print("JSON Error: ");
@@ -150,9 +137,9 @@ void loadWifiConfig() {
         const char* ssid = net["ssid"];
         const char* pass = net["pass"];
 
+        if (!ssid || !pass) continue; // 🔑 Null-check
+
         Serial.printf("Connecting to: %s\n", ssid);
-        
-        // Update UI
         char msg[64];
         snprintf(msg, sizeof(msg), "Connecting to:\n%s", ssid);
         ui_update_status(msg);
@@ -160,149 +147,132 @@ void loadWifiConfig() {
         WiFi.begin(ssid, pass);
 
         unsigned long startAttempt = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
-            display.update(); // Keep UI alive during wait
-            delay(10);
+        const unsigned long CONNECT_TIMEOUT = 8000;
+
+        while (WiFi.status() != WL_CONNECTED && (millis() - startAttempt) < CONNECT_TIMEOUT) {
+            display.update();
+            handle_buttons();
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
 
         if (WiFi.status() == WL_CONNECTED) {
             Serial.println("Success!");
             Serial.print("IP Address: ");
             Serial.println(WiFi.localIP());
-            return; 
+            return;
         } else {
             Serial.println("Failed, trying next...");
             WiFi.disconnect();
+            vTaskDelay(pdMS_TO_TICKS(300));
         }
     }
     ui_update_status("All connections\nfailed!");
 }
-
 static inline bool isPressed(uint8_t pinIndex) {
-    // Entradas con pull-up externa: activo en LOW
     int v = ioexp.read1(pinIndex);
     return (v != TCA9555_INVALID_READ) && (v == LOW);
 }
 
-/**
- * @brief Lee los botones del IO expander y actúa.
- */
 void handle_buttons() {
-    // Antirrebote simple: solo permite una acción cada 200ms
-    if (millis() - last_button_press_time < DEBOUNCE_DELAY_MS) {
-        return;
-    }
+    if (millis() - last_button_press_time < DEBOUNCE_DELAY_MS) return;
 
-    // Lee los botones (Activo en BAJO)
     bool left_pressed = isPressed(EXPANDER_PAD_LEFT);
     bool right_pressed = isPressed(EXPANDER_PAD_RIGHT);
     bool down_pressed = isPressed(EXPANDER_BUTTON_BOTTOM);
 
+    if ((left_pressed || right_pressed) && (millis() - last_brightness_change < BRIGHTNESS_DELAY_MS)) return;
+
     if (left_pressed) {
-        // --- Brillo Abajo ---
         uint8_t current_pct = display.getBrightnessPercentage();
-        // CAMBIO: Ajuste de 5%
-        int new_pct = current_pct - 5; 
-        if (new_pct < 1) new_pct = 1; // Mínimo 1%
-
-        // Convertir porcentaje (0-100) a nivel (0-255)
+        int new_pct = current_pct - 5;
+        if (new_pct < 1) new_pct = 1;
         uint8_t new_level_255 = (uint8_t)((new_pct / 100.0f) * 255.0f);
         display.setBrightness(new_level_255);
-        
-        Serial.printf("Brightness set to %d%% (%d/255)\n", new_pct, new_level_255);
         last_button_press_time = millis();
-
+        last_brightness_change = millis();
     } else if (right_pressed) {
-        // --- Brillo Arriba ---
         uint8_t current_pct = display.getBrightnessPercentage();
-        // CAMBIO: Ajuste de 5%
         int new_pct = current_pct + 5;
-        if (new_pct > 100) new_pct = 100; // Máximo 100%
-
-        // Convertir porcentaje (0-100) a nivel (0-255)
+        if (new_pct > 100) new_pct = 100;
         uint8_t new_level_255 = (uint8_t)((new_pct / 100.0f) * 255.0f);
         display.setBrightness(new_level_255);
-        
-        Serial.printf("Brightness set to %d%% (%d/255)\n", new_pct, new_level_255);
         last_button_press_time = millis();
-
+        last_brightness_change = millis();
     } else if (down_pressed) {
-        // --- Apagar/Encender Pantalla ---
         is_screen_on = !is_screen_on;
-        
-        // CORREGIDO: Usar displayOn() y displayOff()
-        if (is_screen_on) {
-            display.getGfx()->displayOn(); // Encender pantalla
-        } else {
-            display.getGfx()->displayOff(); // Apagar pantalla
-        }
-        
-        Serial.printf("Screen Toggled: %s\n", is_screen_on ? "ON" : "OFF");
+        if (is_screen_on) display.getGfx()->displayOn();
+        else display.getGfx()->displayOff();
         last_button_press_time = millis();
     }
 }
 
 void setup() {
     Serial.begin(115200);
-    
-    // 1. Init Display & LVGL
-    Serial.println("Initializing Display...");
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = 5000,
+        .idle_core_mask = 0,  // Watch Core 0 only
+        .trigger_panic = true
+    };
+    esp_task_wdt_reconfigure(&wdt_config);  // Reconfigure if already running
+    esp_task_wdt_add(NULL);  // Add current task (loop) to WDT
+    // In loop() (Core 0 only):
+    esp_task_wdt_reset();  // ✅ This *is* available in Arduino-ESP32
     display.init();
-    
-    // 2. Show Initial UI
     ui_show_connecting();
     display.update();
 
-    // --- AÑADIDO: Inicializar IO Expander ---
-    // Usar el objeto 'ioexp' global
-    
-    // SOLUCIÓN: Evitar colisión de macros. Arduino define INPUT como 0x01,
-    // lo que interfiere con TCA9555::INPUT.
     if (!ioexp.begin(INPUT)) {
-        Serial.println("Warning: IO Expander (TCA9555) not found!");
+        Serial.println("Warning: IO Expander not found!");
         ui_update_status("Error:\nIO Expander");
     } else {
         Serial.println("IO Expander initialized.");
     }
-    // Restaurar la macro de Arduino por si se necesita después
 
-
-    // 3. Init SD Card
     Serial.println("\nBooting Kode Dot FTP...");
     if (!SD_MMC.setPins(clk, cmd, d0)) {
-        Serial.println("Pin change failed!");
+        Serial.println("SD Pin setup failed!");
         ui_update_status("SD Pin Error");
         return;
     }
-    // NOTA: Montas en /sdcard, pero accedes a Wi-Fi.json en /
-    // Asegúrate de que esto sea correcto. El FTP servirá desde /
+
     if (!SD_MMC.begin("/sdcard", 1)) {
-        Serial.println("Card Mount Failed!");
-        ui_update_status("SD Mount Failed\nCheck Card");
+        Serial.println("SD Mount Failed!");
+        ui_update_status("SD Mount Failed");
         return;
     }
     Serial.println("SD Mounted.");
-    
-    // 4. Connect Wi-Fi
-    loadWifiConfig(); // Esta función ahora usa la ruta /Wi-Fi.json
 
-    // 5. Start FTP & Update UI
+    loadWifiConfig();
+
     if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("WiFi Connected. Starting FTP Server on Core 1.");
+
         const char* user = "kode";
         const char* pass = "kode";
-        
-        Serial.println("Starting FTP Server...");
         ftpSrv.begin(user, pass);
-        Serial.println("FTP Ready!");
-        
-        // Show final screen with QR
+
+        // 🔑 LAUNCH FTP ON CORE 1
+        xTaskCreatePinnedToCore(
+            ftpTask,          // Task function
+            "FTP_Server",     // Name
+            8192,             // Stack size (8KB)
+            nullptr,          // Parameters
+            2,                // Priority (lower than UI)
+            nullptr,          // Task handle
+            1                 // Core 1
+        );
+
         ui_show_connected(WiFi.localIP().toString().c_str(), 21, user, pass);
+    } else {
+        Serial.println("WiFi connection failed. FTP disabled.");
+        ui_update_status("WiFi Failed\nFTP Disabled");
     }
 }
 
 void loop() {
-    ftpSrv.handleFTP();
-    display.update();   // Handle LVGL tasks
-    handle_buttons(); // Handle button inputs
-    delay(GUI_LOOP_DELAY_MS); // Añadir un pequeño delay
+    esp_task_wdt_reset();
+    // 🔑 CORE 0: UI ONLY — no FTP here!
+    display.update();
+    handle_buttons();
+    vTaskDelay(pdMS_TO_TICKS(2)); // ~500 Hz, smooth UI
 }
