@@ -1,463 +1,1057 @@
+/*
+ * FTP Serveur for ESP8266
+ * based on FTP Serveur for Arduino Due and Ethernet shield (W5100) or WIZ820io (W5200)
+ * based on Jean-Michel Gallego's work
+ * modified to work with esp8266 SPIFFS by David Paiva david@nailbuster.com
+ * 
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+//  2017: modified by @robo8080
+// 2019: modified by @fa1ke5
+
 #include "ESP32FtpServer.h"
+
 #include <WiFi.h>
+//#include <ESP32WebServer.h>
+#include <FS.h>
+#include "SD_MMC.h"
+//#include "SPI.h"
 
-WiFiServer ftpServer(FTP_CTRL_PORT);
-WiFiServer dataServer(FTP_DATA_PORT_PASV);
 
-FtpServer::FtpServer() {}
 
-void FtpServer::begin(String uname, String pword) {
-    _FTP_USER = uname;
-    _FTP_PASS = pword;
-    ftpServer.begin();
-    dataServer.begin();
-    millisTimeOut = (uint32_t)FTP_TIME_OUT * 60 * 1000;
-    millisDelay = 0;
-    cmdStatus = 0;
+WiFiServer ftpServer( FTP_CTRL_PORT );
+WiFiServer dataServer( FTP_DATA_PORT_PASV );
+
+void FtpServer::begin(String uname, String pword)
+{
+  // Tells the ftp server to begin listening for incoming connection
+	_FTP_USER=uname;
+	_FTP_PASS = pword;
+
+	ftpServer.begin();
+	delay(10);
+	dataServer.begin();	
+	delay(10);
+	millisTimeOut = (uint32_t)FTP_TIME_OUT * 60 * 1000;
+	millisDelay = 0;
+	cmdStatus = 0;
     iniVariables();
 }
 
-void FtpServer::iniVariables() {
-    dataPort = FTP_DATA_PORT_PASV;
-    dataPassiveConn = true;
-    strcpy(cwdName, "/");
-    rnfrCmd = false;
-    transferStatus = 0;
-    lastLogTime = 0;
-    bytesTransfered = 0;
+void FtpServer::iniVariables()
+{
+  // Default for data port
+  dataPort = FTP_DATA_PORT_PASV;
+  
+  // Default Data connection is Active
+  dataPassiveConn = true;
+  
+  // Set the root directory
+  strcpy( cwdName, "/" );
+
+  rnfrCmd = false;
+  transferStatus = 0;
+  
 }
 
-// String FtpServer::getRealpath(const String& path) {
-//     if (path.length() == 0) return String(FTP_MOUNT_POINT) + "/";
-//     if (path[0] == '/') return String(FTP_MOUNT_POINT) + path;
-//     return String(FTP_MOUNT_POINT) + "/" + path;
-// }
+void FtpServer::handleFTP()
+{
+  if((int32_t) ( millisDelay - millis() ) > 0 )
+    return;
 
-int FtpServer::handleFTP() {
-    if ((int32_t)(millisDelay - millis()) > 0) return 0;
-
-    if (ftpServer.hasClient()) {
-        if (!client.connected()) {
-            client = ftpServer.available();
-        } else {
-            WiFiClient reject = ftpServer.available();
-            reject.stop();
-        }
-    }
-
-    if (cmdStatus == 0) {
-        if (client.connected()) disconnectClient();
-        cmdStatus = 1;
-    } else if (cmdStatus == 1) {
-        abortTransfer();
-        iniVariables();
-        cmdStatus = 2;
-    } else if (cmdStatus == 2) {
-        if (client.connected()) {
-            clientConnected();
-            millisEndConnection = millis() + 10000;
-            cmdStatus = 3;
-        }
-    } else if (readChar() > 0) {
-        if (cmdStatus == 3) {
-            if (userIdentity()) cmdStatus = 4;
-            else cmdStatus = 0;
-        } else if (cmdStatus == 4) {
-            if (userPassword()) {
-                cmdStatus = 5;
-                millisEndConnection = millis() + millisTimeOut;
-            } else cmdStatus = 0;
-        } else if (cmdStatus == 5) {
-            if (!processCommand()) cmdStatus = 0;
-            else millisEndConnection = millis() + millisTimeOut;
-        }
-    } else if (!client || !client.connected()) {
-        cmdStatus = 1;
-    }
-
-    if (transferStatus == 1) {
-        if (!doRetrieve()) transferStatus = 0;
-    } else if (transferStatus == 2) {
-        if (!doStore()) transferStatus = 0;
-    } else if (cmdStatus > 2 && !((int32_t)(millisEndConnection - millis()) > 0)) {
-        client.println("530 Timeout");
-        millisDelay = millis() + 200;
-        cmdStatus = 0;
-    }
-    return transferStatus != 0 || cmdStatus != 0;
-}
-
-void FtpServer::clientConnected() {
-    client.println("220 FTP for Kode Dot Ready");
-    iCL = 0;
-}
-
-void FtpServer::disconnectClient() {
+  if (ftpServer.hasClient()) {
+//  if (ftpServer.available()) {
+	  client.stop();
+	  client = ftpServer.available();
+  }
+  
+  if( cmdStatus == 0 )
+  {
+    if( client.connected())
+      disconnectClient();
+    cmdStatus = 1;
+  }
+  else if( cmdStatus == 1 )         // Ftp server waiting for connection
+  {
     abortTransfer();
-    client.println("221 Goodbye");
-    client.stop();
+    iniVariables();
+    #ifdef FTP_DEBUG
+	Serial.println("Ftp server waiting for connection on port "+ String(FTP_CTRL_PORT));
+    #endif
+    cmdStatus = 2;
+  }
+  else if( cmdStatus == 2 )         // Ftp server idle
+  {
+   		
+    if( client.connected() )                // A client connected
+    {
+      clientConnected();      
+      millisEndConnection = millis() + 10 * 1000 ; // wait client id during 10 s.
+      cmdStatus = 3;
+    }
+  }
+  else if( readChar() > 0 )         // got response
+  {
+    if( cmdStatus == 3 )            // Ftp server waiting for user identity
+      if( userIdentity() )
+        cmdStatus = 4;
+      else
+        cmdStatus = 0;
+    else if( cmdStatus == 4 )       // Ftp server waiting for user registration
+      if( userPassword() )
+      {
+        cmdStatus = 5;
+        millisEndConnection = millis() + millisTimeOut;
+      }
+      else
+        cmdStatus = 0;
+    else if( cmdStatus == 5 )       // Ftp server waiting for user command
+      if( ! processCommand())
+        cmdStatus = 0;
+      else
+        millisEndConnection = millis() + millisTimeOut;
+  }
+  else if (!client.connected() || !client)
+  {
+	  cmdStatus = 1;
+      #ifdef FTP_DEBUG
+	    Serial.println("client disconnected");
+	  #endif
+  }
+
+  if( transferStatus == 1 )         // Retrieve data
+  {
+    if( ! doRetrieve())
+      transferStatus = 0;
+  }
+  else if( transferStatus == 2 )    // Store data
+  {
+    if( ! doStore())
+      transferStatus = 0;
+  }
+  else if( cmdStatus > 2 && ! ((int32_t) ( millisEndConnection - millis() ) > 0 ))
+  {
+	  client.println("530 Timeout");
+    millisDelay = millis() + 200;    // delay of 200 ms
+    cmdStatus = 0;
+  }
 }
 
-boolean FtpServer::userIdentity() {
-    if (strcmp(command, "USER") != 0) { client.println("500 Syntax error"); return true; }
-    if (strcmp(parameters, _FTP_USER.c_str()) != 0) { client.println("530 user not found"); return false; }
-    client.println("331 OK. Password required");
-    strcpy(cwdName, "/");
+void FtpServer::clientConnected()
+{
+  #ifdef FTP_DEBUG
+	Serial.println("Client connected!");
+  #endif
+  client.println( "220--- Welcome to FTP for ESP8266 ---");
+  client.println( "220---   By David Paiva   ---");
+  client.println( "220 --   Version "+ String(FTP_SERVER_VERSION) +"   --");
+  iCL = 0;
+}
+
+void FtpServer::disconnectClient()
+{
+  #ifdef FTP_DEBUG
+	Serial.println(" Disconnecting client");
+  #endif
+  abortTransfer();
+  client.println("221 Goodbye");
+  client.stop();
+}
+
+boolean FtpServer::userIdentity()
+{	
+  if( strcmp( command, "USER" ))
+    client.println( "500 Syntax error");
+  if( strcmp( parameters, _FTP_USER.c_str() ))
+    client.println( "530 user not found");
+  else
+  {
+    client.println( "331 OK. Password required");
+    strcpy( cwdName, "/" );
     return true;
+  }
+  millisDelay = millis() + 100;  // delay of 100 ms
+  return false;
 }
 
-boolean FtpServer::userPassword() {
-    if (strcmp(command, "PASS") != 0) { client.println("500 Syntax error"); return true; }
-    if (!parameters || strcmp(parameters, _FTP_PASS.c_str()) != 0) {
-        client.println("530 Login incorrect");
-        return false;
-    }
-    client.println("230 OK.");
+boolean FtpServer::userPassword()
+{
+  if( strcmp( command, "PASS" ))
+    client.println( "500 Syntax error");
+  else if( strcmp( parameters, _FTP_PASS.c_str() ))
+    client.println( "530 ");
+  else
+  {
+    #ifdef FTP_DEBUG
+      Serial.println( "OK. Waiting for commands.");
+    #endif
+    client.println( "230 OK.");
     return true;
+  }
+  millisDelay = millis() + 100;  // delay of 100 ms
+  return false;
 }
 
-boolean FtpServer::processCommand() {
-    if (!strcmp(command, "CDUP")) {
-        client.println("250 Ok. Current directory is \"" + String(cwdName) + "\"");
-    } else if (!strcmp(command, "CWD")) {
-        String dir;
-        if (parameters[0] == '/') dir = parameters;
-        else if (!strcmp(cwdName, "/")) dir = String("/") + parameters;
-        else dir = String(cwdName) + "/" + parameters;
+boolean FtpServer::processCommand()
+{
+  ///////////////////////////////////////
+  //                                   //
+  //      ACCESS CONTROL COMMANDS      //
+  //                                   //
+  ///////////////////////////////////////
 
-        if (SD_MMC.exists((dir).c_str())) {
-            strcpy(cwdName, dir.c_str());
-            client.println("250 CWD Ok. \"" + String(dir) + "\"");
-        } else {
-            client.println("550 directory not found");
-        }
-    } else if (!strcmp(command, "PWD")) {
-        client.println("257 \"" + String(cwdName) + "\"");
-    } else if (!strcmp(command, "QUIT")) {
-        disconnectClient();
-        return false;
-    } else if (!strcmp(command, "PASV")) {
-        if (data.connected()) data.stop();
-        dataIp = WiFi.localIP();
-        dataPort = FTP_DATA_PORT_PASV;
-        client.println("227 Entering Passive Mode (" +
-            String(dataIp[0]) + "," + String(dataIp[1]) + "," +
-            String(dataIp[2]) + "," + String(dataIp[3]) + "," +
-            String(dataPort >> 8) + "," + String(dataPort & 255) + ").");
-        dataPassiveConn = true;
-    } else if (!strcmp(command, "LIST") || !strcmp(command, "NLST") || !strcmp(command, "MLSD")) {
-        if (!dataConnect()) {
-            client.println("425 No data connection");
-        } else {
-            client.println("150 Accepted data connection");
-            File dir = SD_MMC.open((String(cwdName)).c_str());
-            if (!dir || !dir.isDirectory()) {
-                client.println("550 Can't open directory");
-                data.stop();
-                return true;
-            }
-            File file = dir.openNextFile();
-            while (file) {
-                String fn = file.name();
-                if (fn.startsWith(FTP_MOUNT_POINT)) {
-                    fn = fn.substring(strlen(FTP_MOUNT_POINT));
-                    if (fn.isEmpty()) fn = "/";
-                }
-                if (fn.startsWith("/")) fn = fn.substring(1);
-                if (file.isDirectory()) {
-                    data.println("drwxr-xr-x 1 owner group 0 Jan 01 00:00 " + fn);
-                } else {
-                    data.println("-rw-r--r-- 1 owner group " + String(file.size()) + " Jan 01 00:00 " + fn);
-                }
-                file = dir.openNextFile();
-                yield();
-            }
-            dir.close();
-            client.println("226 Transfer complete");
-            data.stop();
-        }
-    } else if (!strcmp(command, "RETR")) {
-        char path[FTP_CWD_SIZE];
-        if (makePath(path)) {
-            String realPath = (String(path));
-            file = SD_MMC.open(realPath.c_str(), "r");
-            if (!file) {
-                client.println("550 File not found");
-            } else if (!dataConnect()) {
-                client.println("425 No data connection");
-                file.close();
-            } else {
-                client.println("150 Opening data connection");
-                millisBeginTrans = millis();
-                lastLogTime = millis();
-                bytesTransfered = 0;
-                transferStatus = 1;
-            }
-        }
-    } else if (!strcmp(command, "STOR")) {
-        char path[FTP_CWD_SIZE];
-        if (makePath(path)) {
-            String realPath = (String(path));
-            file = SD_MMC.open(realPath.c_str(), "w");
-            if (!file) {
-                client.println("451 Can't create file");
-            } else if (!dataConnect()) {
-                client.println("425 No data connection");
-                file.close();
-            } else {
-                client.println("150 Ok to send data");
-                millisBeginTrans = millis();
-                lastLogTime = millis();
-                bytesTransfered = 0;
-                transferStatus = 2;
-            }
-        }
-    } else if (!strcmp(command, "DELE")) {
-        char path[FTP_CWD_SIZE];
-        if (makePath(path)) {
-            if (SD_MMC.remove((String(path)).c_str())) {
-                client.println("250 Deleted");
-            } else {
-                client.println("450 Delete failed");
-            }
-        }
-    } else if (!strcmp(command, "RMD")) {
-        char path[FTP_CWD_SIZE];
-        if (makePath(path)) {
-            if (SD_MMC.rmdir((String(path)).c_str())) {
-                client.println("250 RMD successful");
-            } else {
-                client.println("550 Remove directory failed");
-            }
-        }
-    } else if (!strcmp(command, "MKD")) {
-        String dir;
-        if (parameters[0] == '/') dir = parameters;
-        else if (!strcmp(cwdName, "/")) dir = String("/") + parameters;
-        else dir = String(cwdName) + "/" + parameters;
-        if (SD_MMC.mkdir((dir).c_str())) {
-            client.println("257 Created");
-        } else {
-            client.println("550 Create failed");
-        }
-    } else if (!strcmp(command, "RNFR")) {
-        buf[0] = 0;
-        if (makePath(buf)) {
-            if (SD_MMC.exists((String(buf)).c_str())) {
-                client.println("350 RNFR accepted - file exists");
-                rnfrCmd = true;
-            } else {
-                client.println("550 File not found");
-            }
-        }
-    } else if (!strcmp(command, "RNTO")) {
-        char path[FTP_CWD_SIZE];
-        if (!rnfrCmd) {
-            client.println("503 Need RNFR before RNTO");
-        } else if (makePath(path)) {
-            if (SD_MMC.rename((String(buf)).c_str(), (String(path)).c_str())) {
-                client.println("250 File renamed");
-            } else {
-                client.println("451 Rename failed");
-            }
-        }
-        rnfrCmd = false;
-    } else if (!strcmp(command, "TYPE")) {
-        client.println("200 TYPE is now 8-bit binary");
-    } else if (!strcmp(command, "FEAT")) {
-        client.println("211-Features:");
-        client.println(" PASV");
-        client.println("211 End");
-    } else if (!strcmp(command, "SIZE")) {
-        char path[FTP_CWD_SIZE];
-        if (makePath(path)) {
-            File f = SD_MMC.open((String(path)).c_str(), "r");
-            if (f) {
-                client.println("213 " + String(f.size()));
-                f.close();
-            } else {
-                client.println("550 Not found");
-            }
-        }
-    } else {
-        client.println("500 Unknown command");
+  //
+  //  CDUP - Change to Parent Directory 
+  //
+  if( ! strcmp( command, "CDUP" ) || ( ! strcmp( command, "CWD" ) && ! strcmp( parameters, ".." )))
+  {
+	 bool ok = false;
+	 if( strlen( cwdName ) > 1 )            // do nothing if cwdName is root
+    {
+      // if cwdName ends with '/', remove it (must not append)
+      if( cwdName[ strlen( cwdName ) - 1 ] == '/' )
+        cwdName[ strlen( cwdName ) - 1 ] = 0;
+      // search last '/'
+      char * pSep = strrchr( cwdName, '/' );
+      ok = pSep > cwdName;
+      // if found, ends the string on its position
+      if( ok )
+      {
+        * pSep = 0;
+        ok = SD_MMC.exists( cwdName );
+      }
     }
-    return true;
-}
-
-boolean FtpServer::dataConnect() {
-    if (data.connected()) return true;
-    data.stop();
-    unsigned long start = millis();
-    while (!dataServer.hasClient() && (millis() - start) < 3000) {
-        yield();
-        if (cmdStatus < 3) return false;
+    // if an error appends, move to root
+    if( ! ok )
+      strcpy( cwdName, "/" );
+   // client << F("250 Ok. Current directory is ") << cwdName << eol;
+	 
+	 client.println("250 Ok. Current directory is " + String(cwdName));
+  }
+  //
+  //  CWD - Change Working Directory
+  //
+  else if( ! strcmp( command, "CWD" ))
+  { 
+    
+    
+  char path[ FTP_CWD_SIZE ];
+    if( haveParameter() && makeExistsPath( path ))
+    {
+      strcpy( cwdName, path );
+       client.println( "250 Ok. Current directory is " + String(cwdName) );
+    }  
+    
+    
+    //Serial.print("********************************************cwdName: ");Serial.println(String(cwdName));
+    /*
+    char path[ FTP_CWD_SIZE ];
+    if( strcmp( parameters, "." ) == 0 ){  // 'CWD .' is the same as PWD command
+    
+      client.println( "257 \"" + String(cwdName) + "\" is your current directory");
+      */
+   //   Serial.print("********************************************cwdName: ");Serial.println(String(cwdName));
+   /*
     }
-    if (dataServer.hasClient()) {
-        data = dataServer.available();
-        return data.connected();
-    }
+    else 
+      {   
+        if( haveParameter() && makeExistsPath( path )){  
+         strcpy( cwdName, path );
+        Serial.print("************************parameters: ");Serial.println(parameters);
+        
+        client.println( "250 Ok. Current directory is " + String(cwdName) );
+         Serial.print("********************************************cwdName: ");Serial.println(String(cwdName));
+        }
+      }
+    */
+  }
+  //
+  //  PWD - Print Directory
+  //
+  else if( ! strcmp( command, "PWD" ))
+    client.println( "257 \"" + String(cwdName) + "\" is your current directory");
+  //
+  //  QUIT
+  //
+  else if( ! strcmp( command, "QUIT" ))
+  {
+    disconnectClient();
     return false;
-}
+  }
 
-boolean FtpServer::doRetrieve() {
-    if (!data.connected()) {
-        closeTransfer();
-        return false;
+  ///////////////////////////////////////
+  //                                   //
+  //    TRANSFER PARAMETER COMMANDS    //
+  //                                   //
+  ///////////////////////////////////////
+
+  //
+  //  MODE - Transfer Mode 
+  //
+  else if( ! strcmp( command, "MODE" ))
+  {
+    if( ! strcmp( parameters, "S" ))
+      client.println( "200 S Ok");
+    // else if( ! strcmp( parameters, "B" ))
+    //  client.println( "200 B Ok\r\n";
+    else
+      client.println( "504 Only S(tream) is suported");
+  }
+  //
+  //  PASV - Passive Connection management
+  //
+  else if( ! strcmp( command, "PASV" ))
+  {
+    if (data.connected()) data.stop();
+    //dataServer.begin();
+     //dataIp = Ethernet.localIP();    
+	dataIp = WiFi.localIP();	
+	dataPort = FTP_DATA_PORT_PASV;
+    //data.connect( dataIp, dataPort );
+    //data = dataServer.available();
+    #ifdef FTP_DEBUG
+	Serial.println("Connection management set to passive");
+      Serial.println( "Data port set to " + String(dataPort));
+    #endif
+   client.println( "227 Entering Passive Mode ("+ String(dataIp[0]) + "," + String(dataIp[1])+","+ String(dataIp[2])+","+ String(dataIp[3])+","+String( dataPort >> 8 ) +","+String ( dataPort & 255 )+").");
+   dataPassiveConn = true;
+  }
+  //
+  //  PORT - Data Port
+  //
+  else if( ! strcmp( command, "PORT" ))
+  {
+	if (data) data.stop();
+    // get IP of data client
+    dataIp[ 0 ] = atoi( parameters );
+    char * p = strchr( parameters, ',' );
+    for( uint8_t i = 1; i < 4; i ++ )
+    {
+      dataIp[ i ] = atoi( ++ p );
+      p = strchr( p, ',' );
     }
+    // get port of data client
+    dataPort = 256 * atoi( ++ p );
+    p = strchr( p, ',' );
+    dataPort += atoi( ++ p );
+    if( p == NULL )
+      client.println( "501 Can't interpret parameters");
+    else
+    {
+      
+		client.println("200 PORT command successful");
+      dataPassiveConn = false;
+    }
+  }
+  //
+  //  STRU - File Structure
+  //
+  else if( ! strcmp( command, "STRU" ))
+  {
+    if( ! strcmp( parameters, "F" ))
+      client.println( "200 F Ok");
+    // else if( ! strcmp( parameters, "R" ))
+    //  client.println( "200 B Ok\r\n";
+    else
+      client.println( "504 Only F(ile) is suported");
+  }
+  //
+  //  TYPE - Data Type
+  //
+  else if( ! strcmp( command, "TYPE" ))
+  {
+    if( ! strcmp( parameters, "A" ))
+      client.println( "200 TYPE is now ASII");
+    else if( ! strcmp( parameters, "I" ))
+      client.println( "200 TYPE is now 8-bit binary");
+    else
+      client.println( "504 Unknow TYPE");
+  }
 
-    int16_t nb = file.read((uint8_t*)buf, FTP_BUF_SIZE);
-    if (nb > 0) {
-        data.write((uint8_t*)buf, nb);
-        bytesTransfered += nb;
+  ///////////////////////////////////////
+  //                                   //
+  //        FTP SERVICE COMMANDS       //
+  //                                   //
+  ///////////////////////////////////////
 
-        if (millis() - lastLogTime > 1000) {
-            lastLogTime = millis();
-            if (millis() > millisBeginTrans) {
-                float speed = (float)bytesTransfered / (1024.0 * (millis() - millisBeginTrans) / 1000.0);
-                Serial.printf("Downloading... %.2f KB/s\n", speed);
-            }
+  //
+  //  ABOR - Abort
+  //
+  else if( ! strcmp( command, "ABOR" ))
+  {
+    abortTransfer();
+    client.println( "226 Data connection closed");
+  }
+  //
+  //  DELE - Delete a File 
+  //
+  else if( ! strcmp( command, "DELE" ))
+  {
+    char path[ FTP_CWD_SIZE ];
+    if (haveParameter())
+      client.println( "501 No file name");
+    else if( makePath( path ))
+    {
+      if( ! SD_MMC.exists( path ))
+        client.println( "550 File " + String(parameters) + " not found");
+      else
+      {
+        if( SD_MMC.remove( path ))
+          client.println( "250 Deleted " + String(parameters) );
+        else
+          client.println( "450 Can't delete " + String(parameters));
+      }
+    }
+  }
+  //
+  //  LIST - List 
+  //
+
+  
+ 
+  else if( ! strcmp( command, "LIST" ))
+  {
+     if(dataConnect()){
+     client.println( "150 Accepted data connection");
+      uint16_t nm = 0;
+      File dir=SD_MMC.open(cwdName);
+     if((!dir)||(!dir.isDirectory()))
+        client.println( "550 Can't open directory " + String(cwdName) );
+      else
+      {
+        File file = dir.openNextFile();
+        while( file)
+        {
+          String fn, fs;
+          fn = file.name();
+          int i = fn.lastIndexOf("/")+1;
+          fn.remove(0, i);
+          #ifdef FTP_DEBUG
+          Serial.println("File Name = "+ fn);
+          #endif
+          fs = String(file.size());
+          if(file.isDirectory()){
+            data.println( "01-01-2000  00:00AM <DIR> " + fn);
+          } else {
+            data.println( "01-01-2000  00:00AM " + fs + " " + fn);
+//          data.println( " " + fn );
+          }
+          nm ++;
+          file = dir.openNextFile();
         }
-        yield();
-        return true;
-    }
-    closeTransfer();
-    return false;
-}
-
-boolean FtpServer::doStore() {
-    if (!data.connected()) {
-        closeTransfer();
-        return false;
-    }
-
-    int len = data.available();
-    if (len > 0) {
-        if (len > FTP_BUF_SIZE) len = FTP_BUF_SIZE;
-        int nb = data.read((uint8_t*)buf, len);
-        if (nb > 0) {
-            file.write((uint8_t*)buf, nb);
-            bytesTransfered += nb;
-
-            if (millis() - lastLogTime > 1000) {
-                lastLogTime = millis();
-                if (millis() > millisBeginTrans) {
-                    float speed = (float)bytesTransfered / (1024.0 * (millis() - millisBeginTrans) / 1000.0);
-                    Serial.printf("Uploading... %.2f KB/s\n", speed);
-                }
-            }
-        }
-        yield();
-        return true;
-    }
-    closeTransfer();
-    return false;
-}
-
-void FtpServer::closeTransfer() {
-    uint32_t deltaT = millis() - millisBeginTrans;
-    if (deltaT > 0 && bytesTransfered > 0 && deltaT < 1000000) {
-        float speed = (float)bytesTransfered / (1024.0 * deltaT / 1000.0);
-        client.println("226-File successfully transferred");
-        client.println("226 " + String(deltaT) + " ms, " + String(speed, 2) + " KB/s");
-        Serial.printf("Transfer Done: %u bytes in %u ms (%.2f KB/s)\n", bytesTransfered, deltaT, speed);
-    } else {
-        client.println("226 File successfully transferred");
-        Serial.println("Transfer Done.");
-    }
-    file.close();
-    data.stop();
-}
-
-void FtpServer::abortTransfer() {
-    if (transferStatus > 0) {
-        file.close();
+        client.println( "226 " + String(nm) + " matches total");
         data.stop();
-        client.println("426 Aborted");
-    }
-    transferStatus = 0;
-}
+      }
+      
+      }
+      else{
+        client.println( "425 No data connection");
+        data.stop();
+        }    
+  }
+  
+  //
+  //  MLSD - Listing for Machine Processing (see RFC 3659)
+  //
+  else if( ! strcmp( command, "MLSD" ))
+  {
+    if( ! dataConnect())
+      client.println( "425 No data connection MLSD");
+    else
+    {
+	  client.println( "150 Accepted data connection");
+      uint16_t nm = 0;
+//      Dir dir= SD.openDir(cwdName);
+      File dir= SD_MMC.open(cwdName);
+      char dtStr[ 15 ];
+    //  if(!SD.exists(cwdName))
+     if((!dir)||(!dir.isDirectory()))
+        client.println( "550 Can't open directory " +String(cwdName) );
+//        client.println( "550 Can't open directory " +String(parameters) );
+      else
+      {
+//        while( dir.next())
+        File file = dir.openNextFile();
+//        while( dir.openNextFile())
+        while( file)
+    		{
+        
+    			String fn,fs;
+          fn = file.name();
+          int pos = fn.lastIndexOf("/"); //ищем начало файла по последнему "/"
+          fn.remove(0, pos+1); //Удаляем все до имени файла включительно
+          fs = String(file.size());
+          if(file.isDirectory()){
+	  
+//	      data.println(fn);
+              data.println( "Type=dir;Size=" + fs + ";"+"modify=20000101000000;" +" " + fn);
 
-int8_t FtpServer::readChar() {
-    int8_t rc = -1;
-    if (client.available()) {
-        char c = client.read();
-        if (c == '\\') c = '/';
-
-        if (c == '\n') {
-            if (iCL >= FTP_CMD_SIZE - 1) {
-                iCL = 0;
-                client.println("500 Command too long");
-                return -2;
-            }
-            cmdLine[iCL] = 0;
-            command[0] = 0;
-            parameters = NULL;
-
-            if (iCL == 0) {
-                rc = 0;
-            } else {
-                rc = iCL;
-                parameters = strchr(cmdLine, ' ');
-                if (parameters != NULL) {
-                    size_t cmdLen = parameters - cmdLine;
-                    if (cmdLen > 4) {
-                        rc = -2;
-                    } else {
-                        strncpy(command, cmdLine, cmdLen);
-                        command[cmdLen] = 0;
-                        while (*(++parameters) == ' ');
-                    }
-                } else if (strlen(cmdLine) > 4) {
-                    rc = -2;
-                } else {
-                    strcpy(command, cmdLine);
-                }
-                iCL = 0;
-            }
-
-            if (rc > 0) {
-                for (uint8_t i = 0; i < strlen(command); i++) {
-                    command[i] = toupper(command[i]);
-                }
-            }
-            if (rc == -2) {
-                iCL = 0;
-                client.println("500 Syntax error");
-            }
-        } else if (c != '\r') {
-            if (iCL < FTP_CMD_SIZE - 1) {
-                cmdLine[iCL++] = c;
-            } else {
-                rc = -2;
-            }
+          } else {
+//	      data.println( fs + " " + fn);
+              data.println( "Type=file;Size=" + fs + ";"+"modify=20000101160656;" +" " + fn);
+	      
+          }
+          nm ++;
+          file = dir.openNextFile();
         }
+        client.println( "226-options: -a -l");
+        client.println( "226 " + String(nm) + " matches total");
+      }
+      data.stop();
     }
-    return rc;
+  }
+  //
+  //  NLST - Name List 
+  //
+  else if( ! strcmp( command, "NLST" ))
+  {
+    if( ! dataConnect())
+      client.println( "425 No data connection");
+    else
+    {
+      client.println( "150 Accepted data connection");
+      uint16_t nm = 0;
+//      Dir dir=SD.openDir(cwdName);
+      File dir= SD_MMC.open(cwdName);
+      if( !SD_MMC.exists( cwdName ))
+        client.println( "550 Can't open directory " + String(parameters));
+      else
+      {
+          File file = dir.openNextFile();
+//        while( dir.next())
+        while( file)
+        {
+//          data.println( dir.fileName());
+          data.println( file.name());
+          nm ++;
+          file = dir.openNextFile();
+        }
+        client.println( "226 " + String(nm) + " matches total");
+      }
+      data.stop();
+    }
+  }
+  //
+  //  NOOP
+  //
+  else if( ! strcmp( command, "NOOP" ))
+  {
+    // dataPort = 0;
+    client.println( "200 Zzz...");
+  }
+  //
+  //  RETR - Retrieve
+  //
+  else if( ! strcmp( command, "RETR" ))
+  {
+    char path[ FTP_CWD_SIZE ];
+    if (haveParameter())
+      client.println( "501 No file name");
+    else if( makePath( path ))
+	{
+		file = SD_MMC.open(path, "r");
+      if( !file){
+        client.println( "550 File " +String(parameters)+ " not found");
+        client.println( "450 Can't open " +String(parameters));
+        }
+      else if( ! dataConnect())
+        client.println( "425 No data connection");
+      else
+      {
+        #ifdef FTP_DEBUG
+		  Serial.println("Sending " + String(parameters));
+        #endif
+        client.println( "150-Connected to port "+ String(dataPort));
+        client.println( "150 " + String(file.size()) + " bytes to download");
+        millisBeginTrans = millis();
+        bytesTransfered = 0;
+        transferStatus = 1;
+      }
+    }
+  }
+  //
+  //  STOR - Store
+  //
+  else if( ! strcmp( command, "STOR" ))
+  {
+    char path[ FTP_CWD_SIZE ];
+    if (haveParameter())
+      client.println( "501 No file name");
+    else if( makePath( path ))
+    {
+		file = SD_MMC.open(path, "w");
+      if( !file)
+        client.println( "451 Can't open/create " +String(parameters) );
+      else if( ! dataConnect())
+      {
+        client.println( "425 No data connection");
+        file.close();
+      }
+      else
+      {
+        #ifdef FTP_DEBUG
+          Serial.println( "Receiving " +String(parameters));
+        #endif
+        client.println( "150 Connected to port " + String(dataPort));
+        millisBeginTrans = millis();
+        bytesTransfered = 0;
+        transferStatus = 2;
+      }
+    }
+  }
+  //
+  //  MKD - Make Directory
+  //
+  
+  else if( ! strcmp( command, "MKD" ))
+  {
+     char path[ FTP_CWD_SIZE ];
+     if( haveParameter() && makePath( path )){
+      if (SD_MMC.exists( path )){
+        client.println( "521 Can't create \"" + String(parameters) + ", Directory exists");
+        }
+        else
+        {
+          if( SD_MMC.mkdir( path )){
+            client.println( "257 \"" + String(parameters) + "\" created");
+            }
+            else{
+              client.println( "550 Can't create \"" + String(parameters));
+              }
+          }
+      
+      }
+	 
+  }
+  //
+  //  RMD - Remove a Directory 
+  //
+  else if( ! strcmp( command, "RMD" ))
+  {
+	 char path[ FTP_CWD_SIZE ];
+     if( haveParameter() && makePath( path )){
+      if( SD_MMC.rmdir( path )){
+        #ifdef FTP_DEBUG
+        Serial.println( " Deleting " +String(parameters));
+         
+        #endif
+        client.println( "250 \"" + String(parameters) + "\" deleted");
+        
+        }
+        else
+        {
+        client.println( "550 Can't remove \"" + String(parameters) + "\". Directory not empty?");  
+          }
+      } 
+	
+  }
+  //
+  //  RNFR - Rename From 
+  //
+  else if( ! strcmp( command, "RNFR" ))
+  {
+    buf[ 0 ] = 0;
+    if( strlen( parameters ) == 0 )
+      client.println( "501 No file name");
+    else if( makePath( buf ))
+    {
+      if( ! SD_MMC.exists( buf ))
+        client.println( "550 File " +String(parameters)+ " not found");
+      else
+      {
+        #ifdef FTP_DEBUG
+		  Serial.println("Renaming " + String(buf));
+        #endif
+        client.println( "350 RNFR accepted - file exists, ready for destination");     
+        rnfrCmd = true;
+      }
+    }
+  }
+  //
+  //  RNTO - Rename To 
+  //
+  else if( ! strcmp( command, "RNTO" ))
+  {  
+    char path[ FTP_CWD_SIZE ];
+    char dir[ FTP_FIL_SIZE ];
+    if( strlen( buf ) == 0 || ! rnfrCmd )
+      client.println( "503 Need RNFR before RNTO");
+    else if (haveParameter())
+      client.println( "501 No file name");
+    else if( makePath( path ))
+    {
+      if( SD_MMC.exists( path ))
+        client.println( "553 " +String(parameters)+ " already exists");
+      else
+      {          
+            #ifdef FTP_DEBUG
+		  Serial.println("Renaming " + String(buf) + " to " + String(path));
+            #endif
+            if( SD_MMC.rename( buf, path ))
+              client.println( "250 File successfully renamed or moved");
+            else
+				client.println( "451 Rename/move failure");
+                                 
+      }
+    }
+    rnfrCmd = false;
+  }
+
+  ///////////////////////////////////////
+  //                                   //
+  //   EXTENSIONS COMMANDS (RFC 3659)  //
+  //                                   //
+  ///////////////////////////////////////
+
+  //
+  //  FEAT - New Features
+  //
+  else if( ! strcmp( command, "FEAT" ))
+  {
+    client.println( "211-Extensions suported:");
+    client.println( " MLSD");
+    client.println( "211 End.");
+  }
+  //
+  //  MDTM - File Modification Time (see RFC 3659)
+  //
+  else if (!strcmp(command, "MDTM"))
+  {
+	  client.println("550 Unable to retrieve time");
+  }
+
+  //
+  //  SIZE - Size of the file
+  //
+  else if( ! strcmp( command, "SIZE" ))
+  {
+    char path[ FTP_CWD_SIZE ];
+    if( strlen( parameters ) == 0 )
+      client.println( "501 No file name");
+    else if( makePath( path ))
+	{
+		file = SD_MMC.open(path, "r");
+      if(!file)
+         client.println( "450 Can't open " +String(parameters) );
+      else
+      {
+        client.println( "213 " + String(file.size()));
+        file.close();
+      }
+    }
+  }
+  //
+  //  SITE - System command
+  //
+  else if( ! strcmp( command, "SITE" ))
+  {
+      client.println( "500 Unknow SITE command " +String(parameters) );
+  }
+  //
+  //  Unrecognized commands ...
+  //
+  else
+    client.println( "500 Unknow command");
+  
+  return true;
 }
 
-boolean FtpServer::makePath(char* fullName) {
-    return makePath(fullName, parameters);
+boolean FtpServer::dataConnect()
+{
+  unsigned long startTime = millis();
+  //wait 5 seconds for a data connection
+  if (!data.connected())
+  {
+    while (!dataServer.hasClient() && millis() - startTime < 10000)
+//    while (!dataServer.available() && millis() - startTime < 10000)
+	  {
+		  //delay(100);
+		  yield();
+	  }
+    if (dataServer.hasClient()) {
+//    if (dataServer.available()) {
+		  data.stop();
+		  data = dataServer.available();
+			#ifdef FTP_DEBUG
+		      Serial.println("ftpdataserver client....");
+			#endif
+		
+	  }
+  }
+
+  return data.connected();
+
 }
 
-boolean FtpServer::makePath(char* fullName, char* param) {
-    if (!fullName || !param) return false;
-    fullName[0] = '\0';
+boolean FtpServer::doRetrieve()
+{
+if (data.connected())
+{
+  int16_t nb = file.readBytes(buf, FTP_BUF_SIZE);
+  if (nb > 0)
+    {
+    data.write((uint8_t*)buf, nb);
+    bytesTransfered += nb;
+    return true;
+  }
+}
+closeTransfer();
+return false;
+}
 
-    if (strcmp(param, "/") == 0 || strlen(param) == 0) {
-        strcpy(fullName, "/");
-        return true;
-    }
 
-    if (param[0] != '/') {
-        size_t len = strlen(cwdName);
-        if (len + 1 + strlen(param) >= FTP_CWD_SIZE - 1) return false;
-        strcpy(fullName, cwdName);
-        if (len > 0 && fullName[len - 1] != '/') strcat(fullName, "/");
-        strncat(fullName, param, FTP_CWD_SIZE - strlen(fullName) - 1);
-    } else {
-        if (strlen(param) >= FTP_CWD_SIZE) return false;
-        strcpy(fullName, param);
+boolean FtpServer::doStore()
+{
+  if( data.connected() )
+  {
+    int16_t nb = data.readBytes((uint8_t*) buf, FTP_BUF_SIZE );
+    if( nb > 0 )
+    {
+      // Serial.println( millis() << " " << nb << endl;
+      file.write((uint8_t*) buf, nb );
+      bytesTransfered += nb;
     }
     return true;
+  }
+  closeTransfer();
+  return false;
+}
+
+void FtpServer::closeTransfer()
+{
+  uint32_t deltaT = (int32_t) ( millis() - millisBeginTrans );
+  if( deltaT > 0 && bytesTransfered > 0 )
+  {
+    client.println( "226-File successfully transferred");
+    client.println( "226 " + String(deltaT) + " ms, "+ String(bytesTransfered / deltaT) + " kbytes/s");
+  }
+  else
+    client.println( "226 File successfully transferred");
+  
+  file.close();
+  data.stop();
+}
+
+void FtpServer::abortTransfer()
+{
+  if( transferStatus > 0 )
+  {
+    file.close();
+    data.stop(); 
+    client.println( "426 Transfer aborted"  );
+    #ifdef FTP_DEBUG
+      Serial.println( "Transfer aborted!") ;
+    #endif
+  }
+  transferStatus = 0;
+}
+
+// Read a char from client connected to ftp server
+//
+//  update cmdLine and command buffers, iCL and parameters pointers
+//
+//  return:
+//    -2 if buffer cmdLine is full
+//    -1 if line not completed
+//     0 if empty line received
+//    length of cmdLine (positive) if no empty line received 
+
+int8_t FtpServer::readChar()
+{
+  int8_t rc = -1;
+
+  if( client.available())
+  {
+    char c = client.read();
+	 // char c;
+	 // client.readBytes((uint8_t*) c, 1);
+    #ifdef FTP_DEBUG
+      Serial.print( c);
+    #endif
+    if( c == '\\' )
+      c = '/';
+    if( c != '\r' )
+      if( c != '\n' )
+      {
+        if( iCL < FTP_CMD_SIZE )
+          cmdLine[ iCL ++ ] = c;
+        else
+          rc = -2; //  Line too long
+      }
+      else
+      {
+        cmdLine[ iCL ] = 0;
+        command[ 0 ] = 0;
+        parameters = NULL;
+        // empty line?
+        if( iCL == 0 )
+          rc = 0;
+        else
+        {
+          rc = iCL;
+          // search for space between command and parameters
+          parameters = strchr( cmdLine, ' ' );
+          if( parameters != NULL )
+          {
+            if( parameters - cmdLine > 4 )
+              rc = -2; // Syntax error
+            else
+            {
+              strncpy( command, cmdLine, parameters - cmdLine );
+              command[ parameters - cmdLine ] = 0;
+              
+              while( * ( ++ parameters ) == ' ' )
+                ;
+            }
+          }
+          else if( strlen( cmdLine ) > 4 )
+            rc = -2; // Syntax error.
+          else
+            strcpy( command, cmdLine );
+          iCL = 0;
+        }
+      }
+    if( rc > 0 )
+      for( uint8_t i = 0 ; i < strlen( command ); i ++ )
+        command[ i ] = toupper( command[ i ] );
+    if( rc == -2 )
+    {
+      iCL = 0;
+      client.println( "500 Syntax error");
+    }
+  }
+  return rc;
+}
+
+// Make complete path/name from cwdName and parameters
+//
+// 3 possible cases: parameters can be absolute path, relative path or only the name
+//
+// parameters:
+//   fullName : where to store the path/name
+//
+// return:
+//    true, if done
+
+boolean FtpServer::makePath( char * fullName )
+{
+  return makePath( fullName, parameters );
+}
+
+boolean FtpServer::makePath( char * fullName, char * param )
+{
+  if( param == NULL )
+    param = parameters;
+    
+  // Root or empty?
+  if( strcmp( param, "/" ) == 0 || strlen( param ) == 0 )
+  {
+    strcpy( fullName, "/" );
+    return true;
+  }
+  // If relative path, concatenate with current dir
+  if( param[0] != '/' ) 
+  {
+    strcpy( fullName, cwdName );
+    if( fullName[ strlen( fullName ) - 1 ] != '/' )
+      strncat( fullName, "/", FTP_CWD_SIZE );
+    strncat( fullName, param, FTP_CWD_SIZE );
+  }
+  else
+    strcpy( fullName, param );
+  // If ends with '/', remove it
+  uint16_t strl = strlen( fullName ) - 1;
+  if( fullName[ strl ] == '/' && strl > 1 )
+    fullName[ strl ] = 0;
+  if( strlen( fullName ) < FTP_CWD_SIZE )
+    return true;
+
+  client.println( "500 Command line too long");
+  return false;
+}
+
+// Calculate year, month, day, hour, minute and second
+//   from first parameter sent by MDTM command (YYYYMMDDHHMMSS)
+//
+// parameters:
+//   pyear, pmonth, pday, phour, pminute and psecond: pointer of
+//     variables where to store data
+//
+// return:
+//    0 if parameter is not YYYYMMDDHHMMSS
+//    length of parameter + space
+
+uint8_t FtpServer::getDateTime( uint16_t * pyear, uint8_t * pmonth, uint8_t * pday,
+                                uint8_t * phour, uint8_t * pminute, uint8_t * psecond )
+{
+  char dt[ 15 ];
+
+  // Date/time are expressed as a 14 digits long string
+  //   terminated by a space and followed by name of file
+  if( strlen( parameters ) < 15 || parameters[ 14 ] != ' ' )
+    return 0;
+  for( uint8_t i = 0; i < 14; i++ )
+    if( ! isdigit( parameters[ i ]))
+      return 0;
+
+  strncpy( dt, parameters, 14 );
+  dt[ 14 ] = 0;
+  * psecond = atoi( dt + 12 ); 
+  dt[ 12 ] = 0;
+  * pminute = atoi( dt + 10 );
+  dt[ 10 ] = 0;
+  * phour = atoi( dt + 8 );
+  dt[ 8 ] = 0;
+  * pday = atoi( dt + 6 );
+  dt[ 6 ] = 0 ;
+  * pmonth = atoi( dt + 4 );
+  dt[ 4 ] = 0 ;
+  * pyear = atoi( dt );
+  return 15;
+}
+
+// Create string YYYYMMDDHHMMSS from date and time
+//
+// parameters:
+//    date, time 
+//    tstr: where to store the string. Must be at least 15 characters long
+//
+// return:
+//    pointer to tstr
+
+char * FtpServer::makeDateTimeStr( char * tstr, uint16_t date, uint16_t time )
+{
+  sprintf( tstr, "%04u%02u%02u%02u%02u%02u",
+           (( date & 0xFE00 ) >> 9 ) + 1980, ( date & 0x01E0 ) >> 5, date & 0x001F,
+           ( time & 0xF800 ) >> 11, ( time & 0x07E0 ) >> 5, ( time & 0x001F ) << 1 );            
+  return tstr;
+}
+
+bool FtpServer::haveParameter()
+{
+  if( parameters != NULL && strlen( parameters ) > 0 )
+    return true;
+  client.println ("501 No file name");
+  return false;  
+}
+bool FtpServer::makeExistsPath( char * path, char * param )
+{
+  if( ! makePath( path, param ))
+    return false;
+  if( SD_MMC.exists( path ))
+    return true;
+  client.println("550 " + String(path) + " not found.");
+
+  return false;
 }
